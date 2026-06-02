@@ -15,46 +15,46 @@ import export
 from core import cache as cache_mod
 from core.metrics import fetch_historical_metrics, expand_to_output_rows
 from core.models import Row
+from ui import _theme
 
 
 COMPETITION_DISPLAY = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
 
 
 def render(cfg, client, conn):
-    st.subheader("Bulk Metrics")
+    with st.container(border=True):
+        _theme.section_title("Input")
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            pasted = st.text_area(
+                "Paste keywords (one per line)",
+                height=190,
+                key="metrics_pasted",
+                placeholder="car insurance\nbest mattress\npersonal loan",
+                label_visibility="collapsed",
+            )
+        with col2:
+            uploaded = st.file_uploader("Or upload CSV", type=["csv", "txt"], key="metrics_upload")
+            force_refresh = st.checkbox(
+                "Force refresh (bypass cache)",
+                key="metrics_force",
+                help=f"Cache freshness window: {cfg.cache_freshness_days} days.",
+            )
+            run_clicked = st.button("Run", type="primary", key="metrics_run", use_container_width=True)
 
-    # --- Input
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        pasted = st.text_area(
-            "Paste keywords (one per line)",
-            height=180,
-            key="metrics_pasted",
-            placeholder="car insurance\nbest mattress\npersonal loan",
-        )
-    with col2:
-        uploaded = st.file_uploader("…or upload CSV", type=["csv", "txt"], key="metrics_upload")
-        force_refresh = st.checkbox(
-            "Force refresh (bypass cache)",
-            key="metrics_force",
-            help=f"Cache freshness window: {cfg.cache_freshness_days} days.",
-        )
-
-    if st.button("Run", type="primary", key="metrics_run"):
+    if run_clicked:
         keywords = _collect_keywords(pasted, uploaded)
         if not keywords:
             st.warning("No keywords to run.")
             return
         _run_metrics(cfg, client, conn, keywords, force_refresh)
 
-    # --- Last-run results
     output = st.session_state.get("metrics_output")
     if not output:
         st.caption("Run a query to see results here.")
     else:
         _render_results(cfg, conn, output)
 
-    st.divider()
     _render_saved_searches(cfg, client, conn)
 
 
@@ -124,8 +124,8 @@ def _run_metrics(cfg, client, conn, keywords: list[str], force_refresh: bool):
     output = expand_to_output_rows(keywords, rows_by_kw)
     st.session_state["metrics_output"] = output
     st.session_state["metrics_input_keywords"] = keywords
-    st.success(f"Resolved {len(rows_by_kw)} unique keywords. "
-               f"Output rows: {len(output)}. Chunks fetched: {state['calls']}.")
+    st.session_state["metrics_last_calls"] = state["calls"]
+    st.session_state["metrics_last_unique"] = len(rows_by_kw)
 
 
 def _output_to_df(output: list[tuple[str, Row]]) -> pd.DataFrame:
@@ -148,24 +148,40 @@ def _output_to_df(output: list[tuple[str, Row]]) -> pd.DataFrame:
 def _render_results(cfg, conn, output: list[tuple[str, Row]]):
     df = _output_to_df(output)
 
-    st.markdown("**Filters**")
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        min_searches = st.number_input(
-            "Min avg searches (last 3mo)",
-            min_value=0, value=0, step=100, key="filter_min_searches",
-        )
-    with fc2:
-        max_high_bid = st.number_input(
-            "Max high bid (₹)",
-            min_value=0.0, value=0.0, step=10.0, key="filter_max_bid",
-            help="0 = no limit",
-        )
-    with fc3:
-        comp_options = ["Low", "Medium", "High"]
-        comp_selected = st.multiselect(
-            "Competition", comp_options, default=comp_options, key="filter_comp",
-        )
+    # Summary tiles
+    n_total = len(df)
+    n_data = int(df["_row"].apply(lambda r: r.has_data).sum())
+    n_merged = int(df["_row"].apply(lambda r: r.is_close_variant_merged).sum())
+    avg_searches = df["Avg searches (last 3mo)"].dropna().mean() if n_data else 0
+    last_calls = st.session_state.get("metrics_last_calls", 0)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Output rows", f"{n_total:,}")
+    m2.metric("With data", f"{n_data:,}")
+    m3.metric("Avg searches (mean)", f"{int(avg_searches):,}" if avg_searches else "—")
+    m4.metric("API calls (last run)", f"{last_calls}")
+    if n_merged:
+        st.caption(f"{n_merged} input keyword(s) merged into a close variant — see Status column.")
+
+    with st.container(border=True):
+        _theme.section_title("Filters")
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            min_searches = st.number_input(
+                "Min avg searches (last 3mo)",
+                min_value=0, value=0, step=100, key="filter_min_searches",
+            )
+        with fc2:
+            max_high_bid = st.number_input(
+                "Max high bid (₹)",
+                min_value=0.0, value=0.0, step=10.0, key="filter_max_bid",
+                help="0 = no limit",
+            )
+        with fc3:
+            comp_options = ["Low", "Medium", "High"]
+            comp_selected = st.multiselect(
+                "Competition", comp_options, default=comp_options, key="filter_comp",
+            )
 
     # Apply filters
     mask = pd.Series([True] * len(df))
@@ -181,7 +197,6 @@ def _render_results(cfg, conn, output: list[tuple[str, Row]]):
 
     st.caption(f"Showing {len(filtered)} of {len(df)} rows after filters.")
 
-    # Add shortlist checkboxes from current persistent shortlist
     sl_keywords = db.shortlist_keywords(conn)
     filtered["Shortlist"] = filtered["_norm"].apply(lambda n: n in sl_keywords)
 
@@ -203,39 +218,47 @@ def _render_results(cfg, conn, output: list[tuple[str, Row]]):
         key="metrics_table",
     )
 
-    cA, cB, cC = st.columns(3)
-    with cA:
-        if st.button("Save shortlist toggles", key="metrics_save_sl"):
-            _persist_shortlist_toggles(conn, filtered, edited)
-            st.rerun()
-    with cB:
-        csv_str = export.output_rows_to_csv(
-            [(inp, r) for inp, r in output if cache_mod.normalize(inp) in set(filtered["_norm"])]
-        )
-        st.download_button(
-            "Download filtered view (CSV)",
-            data=csv_str.encode("utf-8"),
-            file_name="keywords_filtered.csv",
-            mime="text/csv",
-            key="metrics_dl_filtered",
-        )
-    with cC:
-        label = st.text_input("Save search label", key="metrics_save_label", placeholder="e.g. June insurance pull")
-        if st.button("Save this search", key="metrics_save_search"):
-            sid = db.save_search(
-                conn,
-                label=label or None,
-                tab="metrics",
-                input_count=len(st.session_state.get("metrics_input_keywords", [])),
-                filters={
-                    "min_searches": min_searches,
-                    "max_high_bid": max_high_bid,
-                    "competition": comp_selected,
-                    "force_refresh": st.session_state.get("metrics_force", False),
-                },
-                input_data={"keywords": st.session_state.get("metrics_input_keywords", [])},
+    with st.container(border=True):
+        _theme.section_title("Actions")
+        cA, cB, cC = st.columns([1, 1, 1.4])
+        with cA:
+            if st.button("Save shortlist toggles", key="metrics_save_sl", use_container_width=True):
+                _persist_shortlist_toggles(conn, filtered, edited)
+                st.rerun()
+        with cB:
+            csv_str = export.output_rows_to_csv(
+                [(inp, r) for inp, r in output if cache_mod.normalize(inp) in set(filtered["_norm"])]
             )
-            st.success(f"Saved search #{sid}.")
+            st.download_button(
+                "Download CSV",
+                data=csv_str.encode("utf-8"),
+                file_name="keywords_filtered.csv",
+                mime="text/csv",
+                key="metrics_dl_filtered",
+                use_container_width=True,
+            )
+        with cC:
+            label = st.text_input(
+                "Save this search as…",
+                key="metrics_save_label",
+                placeholder="e.g. June insurance pull",
+                label_visibility="collapsed",
+            )
+            if st.button("Save search", key="metrics_save_search", use_container_width=True):
+                sid = db.save_search(
+                    conn,
+                    label=label or None,
+                    tab="metrics",
+                    input_count=len(st.session_state.get("metrics_input_keywords", [])),
+                    filters={
+                        "min_searches": min_searches,
+                        "max_high_bid": max_high_bid,
+                        "competition": comp_selected,
+                        "force_refresh": st.session_state.get("metrics_force", False),
+                    },
+                    input_data={"keywords": st.session_state.get("metrics_input_keywords", [])},
+                )
+                st.success(f"Saved search #{sid}.")
 
 
 def _persist_shortlist_toggles(conn, filtered_df, edited_df):

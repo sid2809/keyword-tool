@@ -15,6 +15,7 @@ import export
 from core import cache as cache_mod
 from core.ideas import IdeaSeed, fetch_keyword_ideas
 from core.models import Row
+from ui import _theme
 
 
 COMPETITION_DISPLAY = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
@@ -23,34 +24,37 @@ RESULTS_DISPLAY_CAP = 5000  # safety cap so the table stays responsive
 
 
 def render(cfg, client, conn):
-    st.subheader("Discover keyword ideas")
+    with st.container(border=True):
+        _theme.section_title("Seed")
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            seed_kws_text = st.text_area(
+                f"Seed keywords (one per line, max {SEED_KW_MAX})",
+                height=190,
+                key="discover_seed_kws",
+                placeholder="car insurance\nauto insurance",
+                label_visibility="collapsed",
+            )
+        with col2:
+            seed_url = st.text_input(
+                "Or a single page URL",
+                key="discover_seed_url",
+                placeholder="https://www.example.com/some-page",
+            )
+            seed_kws = _parse_seed_keywords(seed_kws_text)
+            seed_kind = _decide_seed_kind(seed_kws, seed_url)
+            disabled = (not seed_kind) or (seed_kws and len(seed_kws) > SEED_KW_MAX)
+            run_clicked = st.button("Discover", type="primary", key="discover_run",
+                                    disabled=disabled, use_container_width=True)
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        seed_kws_text = st.text_area(
-            f"Seed keywords (one per line, max {SEED_KW_MAX})",
-            height=180,
-            key="discover_seed_kws",
-            placeholder="car insurance\nauto insurance",
-        )
-    with col2:
-        seed_url = st.text_input(
-            "…and/or a single page URL",
-            key="discover_seed_url",
-            placeholder="https://www.example.com/some-page",
-        )
-
-    seed_kws = _parse_seed_keywords(seed_kws_text)
-    seed_kind = _decide_seed_kind(seed_kws, seed_url)
-
-    if seed_kws and len(seed_kws) > SEED_KW_MAX:
-        st.error(f"Too many seed keywords: {len(seed_kws)}. Max is {SEED_KW_MAX}.")
-    st.caption(f"Seed type: **{seed_kind or '— none —'}**  ·  keywords: {len(seed_kws)}  "
-               f"·  url: {'yes' if seed_url else 'no'}")
-
-    if st.button("Discover", type="primary", key="discover_run", disabled=not seed_kind):
         if seed_kws and len(seed_kws) > SEED_KW_MAX:
-            return
+            st.error(f"Too many seed keywords: {len(seed_kws)}. Max is {SEED_KW_MAX}.")
+        st.caption(
+            f"Seed type: **{seed_kind or '— none —'}**  ·  keywords: {len(seed_kws)}  "
+            f"·  url: {'yes' if seed_url else 'no'}"
+        )
+
+    if run_clicked:
         _run_discover(cfg, client, conn, seed_kws, seed_url)
 
     rows = st.session_state.get("discover_rows")
@@ -59,7 +63,6 @@ def render(cfg, client, conn):
     else:
         _render_results(cfg, conn, rows)
 
-    st.divider()
     _render_saved_searches(cfg, conn)
 
 
@@ -157,24 +160,37 @@ def _rows_to_df(rows: list[Row]) -> pd.DataFrame:
 def _render_results(cfg, conn, rows: list[Row]):
     df = _rows_to_df(rows)
 
-    st.markdown("**Filters**")
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        min_searches = st.number_input(
-            "Min avg searches (last 3mo)",
-            min_value=0, value=0, step=100, key="discover_filter_min",
-        )
-    with fc2:
-        max_high_bid = st.number_input(
-            "Max high bid (₹)",
-            min_value=0.0, value=0.0, step=10.0, key="discover_filter_bid",
-            help="0 = no limit",
-        )
-    with fc3:
-        comp_options = ["Low", "Medium", "High"]
-        comp_selected = st.multiselect(
-            "Competition", comp_options, default=comp_options, key="discover_filter_comp",
-        )
+    # Summary tiles
+    n_total = len(df)
+    n_data = int(df["_row"].apply(lambda r: r.has_data).sum())
+    avg_s = df["Avg searches (last 3mo)"].dropna().mean() if n_data else 0
+    high_bid_med = df["High bid (₹)"].dropna().median() if n_data else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Ideas returned", f"{n_total:,}")
+    m2.metric("With data", f"{n_data:,}")
+    m3.metric("Avg searches (mean)", f"{int(avg_s):,}" if avg_s else "—")
+    m4.metric("Median high bid", f"₹{high_bid_med:,.0f}" if high_bid_med else "—")
+
+    with st.container(border=True):
+        _theme.section_title("Filters")
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            min_searches = st.number_input(
+                "Min avg searches (last 3mo)",
+                min_value=0, value=0, step=100, key="discover_filter_min",
+            )
+        with fc2:
+            max_high_bid = st.number_input(
+                "Max high bid (₹)",
+                min_value=0.0, value=0.0, step=10.0, key="discover_filter_bid",
+                help="0 = no limit",
+            )
+        with fc3:
+            comp_options = ["Low", "Medium", "High"]
+            comp_selected = st.multiselect(
+                "Competition", comp_options, default=comp_options, key="discover_filter_comp",
+            )
 
     mask = pd.Series([True] * len(df))
     if min_searches > 0:
@@ -214,40 +230,46 @@ def _render_results(cfg, conn, rows: list[Row]):
         key="discover_table",
     )
 
-    cA, cB, cC = st.columns(3)
-    with cA:
-        if st.button("Save shortlist toggles", key="discover_save_sl"):
-            _persist_shortlist_toggles(conn, filtered, edited)
-            st.rerun()
-    with cB:
-        # CSV: export the filtered + capped view (1 row per idea)
-        as_pairs = [(r._row.keyword, r._row) for _, r in filtered.iterrows()]
-        csv_str = export.output_rows_to_csv(as_pairs)
-        st.download_button(
-            "Download filtered view (CSV)",
-            data=csv_str.encode("utf-8"),
-            file_name="keyword_ideas.csv",
-            mime="text/csv",
-            key="discover_dl",
-        )
-    with cC:
-        label = st.text_input("Save search label", key="discover_save_label",
-                              placeholder="e.g. competitor URL exploration")
-        if st.button("Save this search", key="discover_save"):
-            sid = db.save_search(
-                conn,
-                label=label or None,
-                tab="discover",
-                input_count=len(st.session_state.get("discover_input", {}).get("keywords", []) or []) +
-                            (1 if st.session_state.get("discover_input", {}).get("url") else 0),
-                filters={
-                    "min_searches": min_searches,
-                    "max_high_bid": max_high_bid,
-                    "competition": comp_selected,
-                },
-                input_data=st.session_state.get("discover_input", {}),
+    with st.container(border=True):
+        _theme.section_title("Actions")
+        cA, cB, cC = st.columns([1, 1, 1.4])
+        with cA:
+            if st.button("Save shortlist toggles", key="discover_save_sl", use_container_width=True):
+                _persist_shortlist_toggles(conn, filtered, edited)
+                st.rerun()
+        with cB:
+            as_pairs = [(r._row.keyword, r._row) for _, r in filtered.iterrows()]
+            csv_str = export.output_rows_to_csv(as_pairs)
+            st.download_button(
+                "Download CSV",
+                data=csv_str.encode("utf-8"),
+                file_name="keyword_ideas.csv",
+                mime="text/csv",
+                key="discover_dl",
+                use_container_width=True,
             )
-            st.success(f"Saved search #{sid}.")
+        with cC:
+            label = st.text_input(
+                "Save this search as…",
+                key="discover_save_label",
+                placeholder="e.g. competitor URL exploration",
+                label_visibility="collapsed",
+            )
+            if st.button("Save search", key="discover_save", use_container_width=True):
+                sid = db.save_search(
+                    conn,
+                    label=label or None,
+                    tab="discover",
+                    input_count=len(st.session_state.get("discover_input", {}).get("keywords", []) or []) +
+                                (1 if st.session_state.get("discover_input", {}).get("url") else 0),
+                    filters={
+                        "min_searches": min_searches,
+                        "max_high_bid": max_high_bid,
+                        "competition": comp_selected,
+                    },
+                    input_data=st.session_state.get("discover_input", {}),
+                )
+                st.success(f"Saved search #{sid}.")
 
 
 def _persist_shortlist_toggles(conn, filtered_df, edited_df):
