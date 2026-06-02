@@ -1,0 +1,306 @@
+"""Discover tab — spec §6 Tab 2.
+
+Seed = keywords (≤20) and/or a page URL. Auto-pick seed type. One ideas call,
+paginated by the SDK. Same filters, shortlist, save, and CSV download.
+"""
+from __future__ import annotations
+
+import io
+
+import pandas as pd
+import streamlit as st
+
+import db
+import export
+from core import cache as cache_mod
+from core.ideas import IdeaSeed, fetch_keyword_ideas
+from core.models import Row
+
+
+COMPETITION_DISPLAY = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
+SEED_KW_MAX = 20  # Phase 0 confirmed cap
+RESULTS_DISPLAY_CAP = 5000  # safety cap so the table stays responsive
+
+
+def render(cfg, client, conn):
+    st.subheader("Discover keyword ideas")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        seed_kws_text = st.text_area(
+            f"Seed keywords (one per line, max {SEED_KW_MAX})",
+            height=180,
+            key="discover_seed_kws",
+            placeholder="car insurance\nauto insurance",
+        )
+    with col2:
+        seed_url = st.text_input(
+            "…and/or a single page URL",
+            key="discover_seed_url",
+            placeholder="https://www.example.com/some-page",
+        )
+
+    seed_kws = _parse_seed_keywords(seed_kws_text)
+    seed_kind = _decide_seed_kind(seed_kws, seed_url)
+
+    if seed_kws and len(seed_kws) > SEED_KW_MAX:
+        st.error(f"Too many seed keywords: {len(seed_kws)}. Max is {SEED_KW_MAX}.")
+    st.caption(f"Seed type: **{seed_kind or '— none —'}**  ·  keywords: {len(seed_kws)}  "
+               f"·  url: {'yes' if seed_url else 'no'}")
+
+    if st.button("Discover", type="primary", key="discover_run", disabled=not seed_kind):
+        if seed_kws and len(seed_kws) > SEED_KW_MAX:
+            return
+        _run_discover(cfg, client, conn, seed_kws, seed_url)
+
+    rows = st.session_state.get("discover_rows")
+    if not rows:
+        st.caption("Run a discovery to see ideas here.")
+    else:
+        _render_results(cfg, conn, rows)
+
+    st.divider()
+    _render_saved_searches(cfg, conn)
+
+
+def _parse_seed_keywords(text: str) -> list[str]:
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _decide_seed_kind(seed_kws: list[str], seed_url: str) -> str | None:
+    has_kw = bool(seed_kws)
+    has_url = bool(seed_url and seed_url.strip())
+    if has_kw and has_url:
+        return "keywords + URL"
+    if has_kw:
+        return "keywords"
+    if has_url:
+        return "URL"
+    return None
+
+
+def _run_discover(cfg, client, conn, seed_kws: list[str], seed_url: str):
+    seed = IdeaSeed(
+        keywords=seed_kws or None,
+        url=seed_url.strip() or None if seed_url else None,
+    )
+    try:
+        seed.validate()
+    except Exception as e:
+        st.error(f"Invalid seed: {e}")
+        return
+
+    currency = st.session_state.get("currency_code")
+    if not currency:
+        from core.google_ads_client import get_account_currency
+        currency = get_account_currency(client, cfg.customer_id)
+        st.session_state["currency_code"] = currency
+
+    MAX_IDEAS = 10000
+    progress = st.progress(0.0, text="Calling Google Ads…")
+    def cb(seen):
+        frac = min(0.95, seen / float(MAX_IDEAS))
+        progress.progress(frac, text=f"Streaming ideas… ({seen:,} so far, cap {MAX_IDEAS:,})")
+
+    def upsert_cb(n):
+        progress.progress(0.97, text=f"Writing {n:,} rows to cache…")
+
+    try:
+        rows = fetch_keyword_ideas(
+            seed,
+            client=client,
+            conn=conn,
+            customer_id=cfg.customer_id,
+            months=cfg.historical_window_months,
+            store_monthly_volumes=cfg.store_monthly_volumes,
+            currency_code=currency,
+            progress_cb=cb,
+            upsert_cb=upsert_cb,
+            max_ideas=MAX_IDEAS,
+        )
+    except Exception as e:
+        progress.empty()
+        st.error(f"API call failed: {type(e).__name__}: {e}")
+        return
+
+    progress.progress(1.0, text=f"Got {len(rows):,} ideas. Done.")
+    progress.empty()
+    st.session_state["discover_rows"] = rows
+    st.session_state["discover_input"] = {
+        "keywords": seed_kws,
+        "url": seed_url,
+    }
+    st.success(f"Got {len(rows)} ideas.")
+
+
+def _rows_to_df(rows: list[Row]) -> pd.DataFrame:
+    out = []
+    for r in rows:
+        out.append({
+            "Keyword": r.keyword,
+            "Avg searches (last 3mo)": r.recent_avg_monthly_searches,
+            "3 month change (%)": r.three_month_change,
+            "Competition": COMPETITION_DISPLAY.get(r.competition or "", r.competition or ""),
+            "Low bid (₹)": (r.low_top_of_page_bid_micros / 1_000_000) if r.low_top_of_page_bid_micros else None,
+            "High bid (₹)": (r.high_top_of_page_bid_micros / 1_000_000) if r.high_top_of_page_bid_micros else None,
+            "Status": "No data" if not r.has_data else "",
+            "_row": r,
+        })
+    return pd.DataFrame(out)
+
+
+def _render_results(cfg, conn, rows: list[Row]):
+    df = _rows_to_df(rows)
+
+    st.markdown("**Filters**")
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        min_searches = st.number_input(
+            "Min avg searches (last 3mo)",
+            min_value=0, value=0, step=100, key="discover_filter_min",
+        )
+    with fc2:
+        max_high_bid = st.number_input(
+            "Max high bid (₹)",
+            min_value=0.0, value=0.0, step=10.0, key="discover_filter_bid",
+            help="0 = no limit",
+        )
+    with fc3:
+        comp_options = ["Low", "Medium", "High"]
+        comp_selected = st.multiselect(
+            "Competition", comp_options, default=comp_options, key="discover_filter_comp",
+        )
+
+    mask = pd.Series([True] * len(df))
+    if min_searches > 0:
+        mask &= df["Avg searches (last 3mo)"].fillna(-1) >= min_searches
+    if max_high_bid > 0:
+        mask &= df["High bid (₹)"].fillna(float("inf")) <= max_high_bid
+    if comp_selected and len(comp_selected) < 3:
+        mask &= df["Competition"].isin(comp_selected)
+    filtered = df[mask].copy()
+
+    capped = False
+    if len(filtered) > RESULTS_DISPLAY_CAP:
+        capped = True
+        filtered = filtered.head(RESULTS_DISPLAY_CAP)
+
+    cap_note = f" (showing first {RESULTS_DISPLAY_CAP:,})" if capped else ""
+    st.caption(f"Showing {len(filtered):,} of {len(df):,} ideas after filters{cap_note}.")
+
+    sl_keywords = db.shortlist_keywords(conn)
+    filtered["Shortlist"] = filtered["Keyword"].apply(lambda k: k in sl_keywords)
+
+    display_cols = ["Shortlist", "Keyword", "Avg searches (last 3mo)",
+                    "3 month change (%)", "Competition",
+                    "Low bid (₹)", "High bid (₹)", "Status"]
+    edited = st.data_editor(
+        filtered[display_cols],
+        hide_index=True,
+        disabled=[c for c in display_cols if c != "Shortlist"],
+        column_config={
+            "Shortlist": st.column_config.CheckboxColumn(default=False),
+            "Avg searches (last 3mo)": st.column_config.NumberColumn(format="%d"),
+            "3 month change (%)": st.column_config.NumberColumn(format="%+.2f"),
+            "Low bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "High bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+        },
+        use_container_width=True,
+        key="discover_table",
+    )
+
+    cA, cB, cC = st.columns(3)
+    with cA:
+        if st.button("Save shortlist toggles", key="discover_save_sl"):
+            _persist_shortlist_toggles(conn, filtered, edited)
+            st.rerun()
+    with cB:
+        # CSV: export the filtered + capped view (1 row per idea)
+        as_pairs = [(r._row.keyword, r._row) for _, r in filtered.iterrows()]
+        csv_str = export.output_rows_to_csv(as_pairs)
+        st.download_button(
+            "Download filtered view (CSV)",
+            data=csv_str.encode("utf-8"),
+            file_name="keyword_ideas.csv",
+            mime="text/csv",
+            key="discover_dl",
+        )
+    with cC:
+        label = st.text_input("Save search label", key="discover_save_label",
+                              placeholder="e.g. competitor URL exploration")
+        if st.button("Save this search", key="discover_save"):
+            sid = db.save_search(
+                conn,
+                label=label or None,
+                tab="discover",
+                input_count=len(st.session_state.get("discover_input", {}).get("keywords", []) or []) +
+                            (1 if st.session_state.get("discover_input", {}).get("url") else 0),
+                filters={
+                    "min_searches": min_searches,
+                    "max_high_bid": max_high_bid,
+                    "competition": comp_selected,
+                },
+                input_data=st.session_state.get("discover_input", {}),
+            )
+            st.success(f"Saved search #{sid}.")
+
+
+def _persist_shortlist_toggles(conn, filtered_df, edited_df):
+    before = list(filtered_df["Shortlist"])
+    after = list(edited_df["Shortlist"])
+    keys = list(filtered_df["Keyword"])
+    rows_by_kw = {r.Keyword: r._row for _, r in filtered_df.iterrows()}
+    added = removed = 0
+    for kw, b, a in zip(keys, before, after):
+        if a == b:
+            continue
+        r: Row = rows_by_kw[kw]
+        if a:
+            db.add_to_shortlist(
+                conn,
+                keyword=kw,
+                source_tab="discover",
+                source_search_id=None,
+                metrics_snapshot={
+                    "recent_avg_monthly_searches": r.recent_avg_monthly_searches,
+                    "three_month_change": r.three_month_change,
+                    "competition": r.competition,
+                    "low_top_of_page_bid_micros": r.low_top_of_page_bid_micros,
+                    "high_top_of_page_bid_micros": r.high_top_of_page_bid_micros,
+                    "currency_code": r.currency_code,
+                },
+            )
+            added += 1
+        else:
+            db.remove_from_shortlist(conn, kw)
+            removed += 1
+    if added or removed:
+        st.toast(f"Shortlist: +{added} / -{removed}")
+
+
+def _render_saved_searches(cfg, conn):
+    with st.expander("Saved discover searches", expanded=False):
+        saved = db.list_searches(conn, tab="discover")
+        if not saved:
+            st.caption("No saved discovery runs yet.")
+            return
+        for s in saved:
+            cA, cB, cC = st.columns([3, 1, 1])
+            cA.markdown(
+                f"**#{s['id']}** · {s['created_at']:%Y-%m-%d %H:%M} · "
+                f"`{s['input_count']}` seeds · {s['label'] or '_(unlabeled)_'}"
+            )
+            if cB.button("Reload", key=f"discover_reload_{s['id']}"):
+                data = s["input_data"] or {}
+                st.session_state["discover_seed_kws"] = "\n".join(data.get("keywords") or [])
+                st.session_state["discover_seed_url"] = data.get("url") or ""
+                st.toast("Loaded — click Discover.")
+                st.rerun()
+            if cC.button("Delete", key=f"discover_del_{s['id']}"):
+                db.delete_search(conn, s["id"])
+                st.rerun()
