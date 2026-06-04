@@ -126,21 +126,31 @@ _VALID_VIEWS = set(_VIEW_TO_LABEL)
 
 def _apply_url_state(cfg: Config) -> None:
     """At the top of each run, BEFORE any widget renders: sync the active
-    view + any saved-search restoration from URL query params.
+    view + saved-search restoration from URL query params.
+
+    We always keep _restore_search alive while ?search= is in the URL —
+    the per-tab render() decides (via _last_applied_search_id) whether to
+    actually re-apply the restore on this run.
     """
     qp = st.query_params
     requested_view = qp.get("view") if qp.get("view") in _VALID_VIEWS else None
     requested_search = qp.get("search")
 
-    # Sync view (URL is authoritative; falls through to default).
     if requested_view:
         st.session_state["view"] = requested_view
         st.session_state["_view_segmented"] = _VIEW_TO_LABEL[requested_view]
     elif "view" not in st.session_state:
         st.session_state["view"] = "metrics"
 
-    # One-shot saved-search restoration.
-    if requested_search and st.session_state.get("_loaded_search_id") != requested_search:
+    if not requested_search:
+        # No active saved-view in URL — drop any stale directive.
+        st.session_state.pop("_restore_search", None)
+        st.session_state.pop("_loaded_search_id", None)
+        return
+
+    # Load (or reuse cached) record for this URL.
+    cached = st.session_state.get("_restore_search")
+    if not cached or st.session_state.get("_loaded_search_id") != requested_search:
         try:
             sid = int(requested_search)
         except ValueError:
@@ -149,19 +159,21 @@ def _apply_url_state(cfg: Config) -> None:
             record = db.load_search(conn, sid)
         if not record:
             return
+        st.session_state["_restore_search"] = record
+        st.session_state["_loaded_search_id"] = requested_search
+        # Snap view to the record's tab so the right render() consumes it.
         tab = record.get("tab")
         if tab in _VALID_VIEWS:
             st.session_state["view"] = tab
             st.session_state["_view_segmented"] = _VIEW_TO_LABEL[tab]
             st.query_params["view"] = tab
-        st.session_state["_restore_search"] = record
-        st.session_state["_loaded_search_id"] = requested_search
 
 
 def _go_home() -> None:
     """Clear all view + restore state and reset the URL to root."""
     for key in (
         "view", "_loaded_search_id", "_restore_search",
+        "_last_applied_metrics_search_id", "_last_applied_discover_search_id",
         "metrics_output", "metrics_input_keywords", "metrics_last_calls",
         "metrics_last_unique", "metrics_last_search_id", "metrics_editing_id",
         "_pending_metrics_paste",

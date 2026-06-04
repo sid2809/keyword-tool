@@ -43,17 +43,26 @@ def _restore_from_record(s: dict) -> None:
 
 
 def render(cfg, client, conn):
-    # URL-driven restore: if a saved search was loaded for this tab, apply it
-    # before any widget renders.
+    # URL-driven restore: apply the saved-search snapshot once per unique
+    # loaded ID. Don't pop _restore_search — keep it for tab switches /
+    # other reruns while ?search= is still in the URL.
     pending = st.session_state.get("_restore_search")
-    if pending and pending.get("tab") == "metrics":
+    loaded_id = st.session_state.get("_loaded_search_id")
+    last_applied = st.session_state.get("_last_applied_metrics_search_id")
+    if pending and pending.get("tab") == "metrics" and last_applied != loaded_id:
         _restore_from_record(pending)
-        st.session_state.pop("_restore_search", None)
+        st.session_state["_last_applied_metrics_search_id"] = loaded_id
 
     # Apply any pending "Reload" paste BEFORE the text_area is instantiated
     # (Streamlit forbids touching a widget key after the widget renders).
     if "_pending_metrics_paste" in st.session_state:
         st.session_state["metrics_pasted"] = st.session_state.pop("_pending_metrics_paste")
+
+    # Visible "Viewing saved" banner when there's a restored snapshot.
+    if pending and pending.get("tab") == "metrics" and st.session_state.get("metrics_output"):
+        label = db.display_label(pending)
+        st.info(f"📌 Viewing saved search **#{pending['id']} · {label}** — output below is the snapshot from "
+                f"{pending['created_at']:%Y-%m-%d %H:%M}. Run again to refresh, or click 🏠 Home to clear.")
 
     with st.container(border=True):
         _theme.section_title("Input")
@@ -176,6 +185,12 @@ def _run_metrics(cfg, client, conn, keywords: list[str], force_refresh: bool):
         output_data=snapshot,
     )
     st.session_state["metrics_last_search_id"] = sid
+    # Fresh run supersedes any prior URL-driven restore context.
+    st.session_state.pop("_restore_search", None)
+    st.session_state.pop("_loaded_search_id", None)
+    st.session_state.pop("_last_applied_metrics_search_id", None)
+    if "search" in st.query_params:
+        del st.query_params["search"]
 
 
 def _output_to_df(output: list[tuple[str, Row]]) -> pd.DataFrame:

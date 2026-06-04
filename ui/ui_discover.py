@@ -40,18 +40,22 @@ def _restore_from_record(s: dict) -> None:
 
 
 def render(cfg, client, conn):
-    # URL-driven restore for this tab.
     pending = st.session_state.get("_restore_search")
-    if pending and pending.get("tab") == "discover":
+    loaded_id = st.session_state.get("_loaded_search_id")
+    last_applied = st.session_state.get("_last_applied_discover_search_id")
+    if pending and pending.get("tab") == "discover" and last_applied != loaded_id:
         _restore_from_record(pending)
-        st.session_state.pop("_restore_search", None)
+        st.session_state["_last_applied_discover_search_id"] = loaded_id
 
-    # Apply pending "Reload" values BEFORE the widgets render (Streamlit
-    # forbids writing to a widget key after the widget exists in this run).
     if "_pending_discover_kws" in st.session_state:
         st.session_state["discover_seed_kws"] = st.session_state.pop("_pending_discover_kws")
     if "_pending_discover_url" in st.session_state:
         st.session_state["discover_seed_url"] = st.session_state.pop("_pending_discover_url")
+
+    if pending and pending.get("tab") == "discover" and st.session_state.get("discover_rows"):
+        label = db.display_label(pending)
+        st.info(f"📌 Viewing saved discovery **#{pending['id']} · {label}** — ideas below are the snapshot from "
+                f"{pending['created_at']:%Y-%m-%d %H:%M}. Run again to refresh, or click 🏠 Home to clear.")
 
     with st.container(border=True):
         _theme.section_title("Seed")
@@ -178,6 +182,12 @@ def _run_discover(cfg, client, conn, seed_kws: list[str], seed_url: str):
         output_data=snapshot,
     )
     st.session_state["discover_last_search_id"] = sid
+    # Fresh run supersedes any prior URL-driven restore context.
+    st.session_state.pop("_restore_search", None)
+    st.session_state.pop("_loaded_search_id", None)
+    st.session_state.pop("_last_applied_discover_search_id", None)
+    if "search" in st.query_params:
+        del st.query_params["search"]
     st.success(f"Got {len(rows)} ideas.")
 
 
