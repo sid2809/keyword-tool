@@ -14,7 +14,7 @@ import db
 import export
 from core import cache as cache_mod
 from core.ideas import IdeaSeed, fetch_keyword_ideas
-from core.models import Row
+from core.models import Row, row_to_dict, row_from_dict
 from ui import _theme
 
 
@@ -136,8 +136,9 @@ def _run_discover(cfg, client, conn, seed_kws: list[str], seed_url: str):
     st.session_state["discover_rows"] = rows
     st.session_state["discover_input"] = {"keywords": seed_kws, "url": seed_url}
 
-    # Auto-save every successful run (unlabeled). User can label later.
+    # Auto-save every successful run, including the output snapshot.
     seed_count = len(seed_kws or []) + (1 if (seed_url or "").strip() else 0)
+    snapshot = {"ideas": [row_to_dict(r) for r in rows]}
     sid = db.save_search(
         conn,
         label=None,
@@ -145,6 +146,7 @@ def _run_discover(cfg, client, conn, seed_kws: list[str], seed_url: str):
         input_count=seed_count,
         filters={},
         input_data={"keywords": seed_kws, "url": seed_url},
+        output_data=snapshot,
     )
     st.session_state["discover_last_search_id"] = sid
     st.success(f"Got {len(rows)} ideas.")
@@ -346,11 +348,19 @@ def _render_saved_searches(cfg, conn):
             if cB.button("✏️", key=f"discover_edit_{s['id']}", help="Rename", use_container_width=True):
                 st.session_state["discover_editing_id"] = s["id"]
                 st.rerun()
-            if cC.button("🔁", key=f"discover_reload_{s['id']}", help="Reload into seed", use_container_width=True):
-                data = s["input_data"] or {}
+            if cC.button("🔁", key=f"discover_reload_{s['id']}", help="Restore saved ideas", use_container_width=True):
+                data = s.get("input_data") or {}
                 st.session_state["discover_seed_kws"] = "\n".join(data.get("keywords") or [])
                 st.session_state["discover_seed_url"] = data.get("url") or ""
-                st.toast("Loaded — click Discover.")
+                out = s.get("output_data") or {}
+                if out.get("ideas"):
+                    restored = [row_from_dict(r) for r in out["ideas"]]
+                    st.session_state["discover_rows"] = restored
+                    st.session_state["discover_input"] = data
+                    st.session_state["discover_last_search_id"] = s["id"]
+                    st.toast(f"Restored {len(restored):,} saved ideas.")
+                else:
+                    st.toast("Loaded seed (no saved output) — click Discover.")
                 st.rerun()
             if cD.button("🗑️", key=f"discover_del_{s['id']}", help="Delete", use_container_width=True):
                 db.delete_search(conn, s["id"])

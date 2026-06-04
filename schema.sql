@@ -28,8 +28,12 @@ CREATE TABLE IF NOT EXISTS searches (
     tab          TEXT NOT NULL,
     input_count  INT,
     filters      JSONB,
-    input_data   JSONB
+    input_data   JSONB,
+    output_data  JSONB
 );
+
+-- Backfill column for DBs that pre-date the output_data field.
+ALTER TABLE searches ADD COLUMN IF NOT EXISTS output_data JSONB;
 
 CREATE TABLE IF NOT EXISTS shortlist (
     id               BIGSERIAL PRIMARY KEY,

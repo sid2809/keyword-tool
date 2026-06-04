@@ -39,15 +39,21 @@ def save_search(
     input_count: int,
     filters: dict,
     input_data: dict,
+    output_data: Optional[dict] = None,
 ) -> int:
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO searches (label, tab, input_count, filters, input_data)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO searches (label, tab, input_count, filters, input_data, output_data)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
-            (label, tab, input_count, json.dumps(filters), json.dumps(input_data)),
+            (
+                label, tab, input_count,
+                json.dumps(filters),
+                json.dumps(input_data),
+                json.dumps(output_data) if output_data is not None else None,
+            ),
         )
         sid = cur.fetchone()["id"]
     conn.commit()

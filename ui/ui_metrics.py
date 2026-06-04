@@ -14,7 +14,7 @@ import db
 import export
 from core import cache as cache_mod
 from core.metrics import fetch_historical_metrics, expand_to_output_rows
-from core.models import Row
+from core.models import Row, row_to_dict, row_from_dict
 from ui import _theme
 
 
@@ -127,7 +127,12 @@ def _run_metrics(cfg, client, conn, keywords: list[str], force_refresh: bool):
     st.session_state["metrics_last_calls"] = state["calls"]
     st.session_state["metrics_last_unique"] = len(rows_by_kw)
 
-    # Auto-save every successful run (unlabeled). User can label later.
+    # Auto-save every successful run, including the output snapshot.
+    snapshot = {
+        "rows": [{"input": inp, "row": row_to_dict(row)} for inp, row in output],
+        "calls": state["calls"],
+        "unique_resolved": len(rows_by_kw),
+    }
     sid = db.save_search(
         conn,
         label=None,
@@ -135,6 +140,7 @@ def _run_metrics(cfg, client, conn, keywords: list[str], force_refresh: bool):
         input_count=len(keywords),
         filters={"force_refresh": force_refresh},
         input_data={"keywords": keywords},
+        output_data=snapshot,
     )
     st.session_state["metrics_last_search_id"] = sid
 
@@ -164,13 +170,13 @@ def _render_results(cfg, conn, output: list[tuple[str, Row]]):
     n_data = int(df["_row"].apply(lambda r: r.has_data).sum())
     n_merged = int(df["_row"].apply(lambda r: r.is_close_variant_merged).sum())
     avg_searches = df["Avg searches (last 3mo)"].dropna().mean() if n_data else 0
-    last_calls = st.session_state.get("metrics_last_calls", 0)
+    last_calls = st.session_state.get("metrics_last_calls")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Output rows", f"{n_total:,}")
     m2.metric("With data", f"{n_data:,}")
     m3.metric("Avg searches (mean)", f"{int(avg_searches):,}" if avg_searches else "—")
-    m4.metric("API calls (last run)", f"{last_calls}")
+    m4.metric("API calls (last run)", f"{last_calls}" if last_calls is not None else "—")
     if n_merged:
         st.caption(f"{n_merged} input keyword(s) merged into a close variant — see Status column.")
 
@@ -339,9 +345,23 @@ def _render_saved_searches(cfg, client, conn):
             if cB.button("✏️", key=f"edit_{s['id']}", help="Rename", use_container_width=True):
                 st.session_state["metrics_editing_id"] = s["id"]
                 st.rerun()
-            if cC.button("🔁", key=f"reload_{s['id']}", help="Reload into input box", use_container_width=True):
-                st.session_state["metrics_pasted"] = "\n".join(s["input_data"].get("keywords", []))
-                st.toast("Loaded into the input box — click Run.")
+            if cC.button("🔁", key=f"reload_{s['id']}", help="Restore saved output", use_container_width=True):
+                inp = s.get("input_data") or {}
+                st.session_state["metrics_pasted"] = "\n".join(inp.get("keywords", []))
+                out = s.get("output_data") or {}
+                if out.get("rows"):
+                    restored = [
+                        (item["input"], row_from_dict(item["row"]))
+                        for item in out["rows"]
+                    ]
+                    st.session_state["metrics_output"] = restored
+                    st.session_state["metrics_input_keywords"] = inp.get("keywords", [])
+                    st.session_state["metrics_last_calls"] = out.get("calls")
+                    st.session_state["metrics_last_unique"] = out.get("unique_resolved", len(restored))
+                    st.session_state["metrics_last_search_id"] = s["id"]
+                    st.toast("Restored saved output.")
+                else:
+                    st.toast("Loaded keywords (no saved output) — click Run.")
                 st.rerun()
             if cD.button("🗑️", key=f"del_{s['id']}", help="Delete", use_container_width=True):
                 db.delete_search(conn, s["id"])
