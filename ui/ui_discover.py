@@ -23,7 +23,29 @@ SEED_KW_MAX = 20  # Phase 0 confirmed cap
 RESULTS_DISPLAY_CAP = 5000  # safety cap so the table stays responsive
 
 
+def _restore_from_record(s: dict) -> None:
+    """Stage session_state for a saved-search restore. Must be called BEFORE
+    any widget with the affected keys is instantiated in the current run."""
+    data = s.get("input_data") or {}
+    st.session_state["_pending_discover_kws"] = "\n".join(data.get("keywords") or [])
+    st.session_state["_pending_discover_url"] = data.get("url") or ""
+    st.session_state["discover_input"] = data
+    out = s.get("output_data") or {}
+    if out.get("ideas"):
+        restored = [row_from_dict(r) for r in out["ideas"]]
+        st.session_state["discover_rows"] = restored
+    else:
+        st.session_state.pop("discover_rows", None)
+    st.session_state["discover_last_search_id"] = s["id"]
+
+
 def render(cfg, client, conn):
+    # URL-driven restore for this tab.
+    pending = st.session_state.get("_restore_search")
+    if pending and pending.get("tab") == "discover":
+        _restore_from_record(pending)
+        st.session_state.pop("_restore_search", None)
+
     # Apply pending "Reload" values BEFORE the widgets render (Streamlit
     # forbids writing to a widget key after the widget exists in this run).
     if "_pending_discover_kws" in st.session_state:
@@ -356,18 +378,11 @@ def _render_saved_searches(cfg, conn):
                 st.session_state["discover_editing_id"] = s["id"]
                 st.rerun()
             if cC.button("🔁", key=f"discover_reload_{s['id']}", help="Restore saved ideas", use_container_width=True):
-                data = s.get("input_data") or {}
-                st.session_state["_pending_discover_kws"] = "\n".join(data.get("keywords") or [])
-                st.session_state["_pending_discover_url"] = data.get("url") or ""
-                out = s.get("output_data") or {}
-                if out.get("ideas"):
-                    restored = [row_from_dict(r) for r in out["ideas"]]
-                    st.session_state["discover_rows"] = restored
-                    st.session_state["discover_input"] = data
-                    st.session_state["discover_last_search_id"] = s["id"]
-                    st.toast(f"Restored {len(restored):,} saved ideas.")
-                else:
-                    st.toast("Loaded seed (no saved output) — click Discover.")
+                _restore_from_record(s)
+                st.query_params["view"] = "discover"
+                st.query_params["search"] = str(s["id"])
+                st.session_state["_loaded_search_id"] = str(s["id"])
+                st.toast("Restored — URL updated.")
                 st.rerun()
             if cD.button("🗑️", key=f"discover_del_{s['id']}", help="Delete", use_container_width=True):
                 db.delete_search(conn, s["id"])

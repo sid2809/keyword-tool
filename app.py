@@ -111,9 +111,70 @@ def render_sidebar(cfg: Config, currency: str | None):
         )
 
         st.divider()
-        if st.button("Lock app", use_container_width=True):
+        col_home, col_lock = st.columns(2)
+        if col_home.button("🏠 Home", use_container_width=True, help="Clear restored search + URL"):
+            _go_home()
+        if col_lock.button("Lock", use_container_width=True):
             st.session_state["unlocked"] = False
             st.rerun()
+
+
+_VIEW_TO_LABEL = {"metrics": "Bulk Metrics", "discover": "Discover", "shortlist": "Shortlist & Saved"}
+_LABEL_TO_VIEW = {v: k for k, v in _VIEW_TO_LABEL.items()}
+_VALID_VIEWS = set(_VIEW_TO_LABEL)
+
+
+def _apply_url_state(cfg: Config) -> None:
+    """At the top of each run, BEFORE any widget renders: sync the active
+    view + any saved-search restoration from URL query params.
+    """
+    qp = st.query_params
+    requested_view = qp.get("view") if qp.get("view") in _VALID_VIEWS else None
+    requested_search = qp.get("search")
+
+    # Sync view (URL is authoritative; falls through to default).
+    if requested_view:
+        st.session_state["view"] = requested_view
+        st.session_state["_view_segmented"] = _VIEW_TO_LABEL[requested_view]
+    elif "view" not in st.session_state:
+        st.session_state["view"] = "metrics"
+
+    # One-shot saved-search restoration.
+    if requested_search and st.session_state.get("_loaded_search_id") != requested_search:
+        try:
+            sid = int(requested_search)
+        except ValueError:
+            return
+        with get_conn(cfg) as conn:
+            record = db.load_search(conn, sid)
+        if not record:
+            return
+        tab = record.get("tab")
+        if tab in _VALID_VIEWS:
+            st.session_state["view"] = tab
+            st.session_state["_view_segmented"] = _VIEW_TO_LABEL[tab]
+            st.query_params["view"] = tab
+        st.session_state["_restore_search"] = record
+        st.session_state["_loaded_search_id"] = requested_search
+
+
+def _go_home() -> None:
+    """Clear all view + restore state and reset the URL to root."""
+    for key in (
+        "view", "_loaded_search_id", "_restore_search",
+        "metrics_output", "metrics_input_keywords", "metrics_last_calls",
+        "metrics_last_unique", "metrics_last_search_id", "metrics_editing_id",
+        "_pending_metrics_paste",
+        "discover_rows", "discover_input", "discover_last_search_id",
+        "discover_editing_id", "_pending_discover_kws", "_pending_discover_url",
+        "all_editing_id",
+    ):
+        st.session_state.pop(key, None)
+    # Reset the segmented_control widget by removing its key too.
+    st.session_state.pop("_view_segmented", None)
+    st.query_params.clear()
+    st.session_state["view"] = "metrics"
+    st.rerun()
 
 
 def main():
@@ -132,6 +193,9 @@ def main():
             st.warning(f"Could not read currency_code: {e}")
             st.session_state["currency_code"] = None
 
+    # Apply URL → state BEFORE any widget is rendered.
+    _apply_url_state(cfg)
+
     currency = st.session_state.get("currency_code")
     render_sidebar(cfg, currency)
 
@@ -143,16 +207,40 @@ def main():
     ]
     _theme.header("Keyword Tool", "Bulk keyword research with cached Postgres lookups", badges)
 
-    tab_metrics, tab_discover, tab_shortlist = st.tabs([
-        "  Bulk Metrics  ", "  Discover  ", "  Shortlist & Saved  ",
-    ])
+    # Tab strip — segmented_control is programmatically selectable.
+    view = st.session_state.get("view", "metrics")
+    label_options = list(_VIEW_TO_LABEL.values())
+    col_strip, col_home = st.columns([5, 1])
+    with col_strip:
+        new_label = st.segmented_control(
+            "View",
+            options=label_options,
+            default=_VIEW_TO_LABEL[view],
+            selection_mode="single",
+            label_visibility="collapsed",
+            key="_view_segmented",
+        )
+    with col_home:
+        if st.button("🏠 Home", use_container_width=True, key="header_home"):
+            _go_home()
+
+    new_view = _LABEL_TO_VIEW.get(new_label or "", view)
+    if new_view != view:
+        st.session_state["view"] = new_view
+        st.query_params["view"] = new_view
+        # Clear search param on manual tab switch — the saved-search context
+        # belongs to a specific tab and shouldn't bleed across.
+        if "search" in st.query_params:
+            del st.query_params["search"]
+            st.session_state.pop("_loaded_search_id", None)
+        st.rerun()
 
     with get_conn(cfg) as conn:
-        with tab_metrics:
+        if new_view == "metrics":
             ui_metrics.render(cfg, client, conn)
-        with tab_discover:
+        elif new_view == "discover":
             ui_discover.render(cfg, client, conn)
-        with tab_shortlist:
+        else:
             ui_shortlist.render(cfg, client, conn)
 
 

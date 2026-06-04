@@ -21,7 +21,35 @@ from ui import _theme
 COMPETITION_DISPLAY = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
 
 
+def _restore_from_record(s: dict) -> None:
+    """Stage session_state for a saved-search restore. Must be called BEFORE
+    any widget with the affected keys is instantiated in the current run."""
+    inp = s.get("input_data") or {}
+    st.session_state["_pending_metrics_paste"] = "\n".join(inp.get("keywords", []))
+    st.session_state["metrics_input_keywords"] = inp.get("keywords", [])
+    out = s.get("output_data") or {}
+    if out.get("rows"):
+        restored = [
+            (item["input"], row_from_dict(item["row"]))
+            for item in out["rows"]
+        ]
+        st.session_state["metrics_output"] = restored
+        st.session_state["metrics_last_calls"] = out.get("calls")
+        st.session_state["metrics_last_unique"] = out.get("unique_resolved", len(restored))
+    else:
+        # No output snapshot — clear any stale results so user knows to Run again.
+        st.session_state.pop("metrics_output", None)
+    st.session_state["metrics_last_search_id"] = s["id"]
+
+
 def render(cfg, client, conn):
+    # URL-driven restore: if a saved search was loaded for this tab, apply it
+    # before any widget renders.
+    pending = st.session_state.get("_restore_search")
+    if pending and pending.get("tab") == "metrics":
+        _restore_from_record(pending)
+        st.session_state.pop("_restore_search", None)
+
     # Apply any pending "Reload" paste BEFORE the text_area is instantiated
     # (Streamlit forbids touching a widget key after the widget renders).
     if "_pending_metrics_paste" in st.session_state:
@@ -351,22 +379,12 @@ def _render_saved_searches(cfg, client, conn):
                 st.session_state["metrics_editing_id"] = s["id"]
                 st.rerun()
             if cC.button("🔁", key=f"reload_{s['id']}", help="Restore saved output", use_container_width=True):
-                inp = s.get("input_data") or {}
-                st.session_state["_pending_metrics_paste"] = "\n".join(inp.get("keywords", []))
-                out = s.get("output_data") or {}
-                if out.get("rows"):
-                    restored = [
-                        (item["input"], row_from_dict(item["row"]))
-                        for item in out["rows"]
-                    ]
-                    st.session_state["metrics_output"] = restored
-                    st.session_state["metrics_input_keywords"] = inp.get("keywords", [])
-                    st.session_state["metrics_last_calls"] = out.get("calls")
-                    st.session_state["metrics_last_unique"] = out.get("unique_resolved", len(restored))
-                    st.session_state["metrics_last_search_id"] = s["id"]
-                    st.toast("Restored saved output.")
-                else:
-                    st.toast("Loaded keywords (no saved output) — click Run.")
+                _restore_from_record(s)
+                # Update URL so the restored view is shareable.
+                st.query_params["view"] = "metrics"
+                st.query_params["search"] = str(s["id"])
+                st.session_state["_loaded_search_id"] = str(s["id"])
+                st.toast("Restored — URL updated.")
                 st.rerun()
             if cD.button("🗑️", key=f"del_{s['id']}", help="Delete", use_container_width=True):
                 db.delete_search(conn, s["id"])

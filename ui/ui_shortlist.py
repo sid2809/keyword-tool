@@ -99,7 +99,7 @@ def render(cfg, client, conn):
     editing_id = st.session_state.get("all_editing_id")
     for s in all_searches:
         label = db.display_label(s)
-        cA, cB, cC = st.columns([5, 1, 1])
+        cA, cB, cC, cD = st.columns([5, 1, 1, 1])
         with cA:
             if editing_id == s["id"]:
                 new_label = st.text_input(
@@ -128,6 +128,13 @@ def render(cfg, client, conn):
         if cB.button("✏️", key=f"all_edit_{s['id']}", help="Rename", use_container_width=True):
             st.session_state["all_editing_id"] = s["id"]
             st.rerun()
-        if cC.button("🗑️", key=f"all_del_{s['id']}", help="Delete", use_container_width=True):
+        with cC:
+            st.link_button(
+                "🔗",
+                url=f"?view={s['tab']}&search={s['id']}",
+                help="Open in a new tab (shareable URL)",
+                use_container_width=True,
+            )
+        if cD.button("🗑️", key=f"all_del_{s['id']}", help="Delete", use_container_width=True):
             db.delete_search(conn, s["id"])
             st.rerun()
