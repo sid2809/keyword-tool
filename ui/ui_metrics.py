@@ -22,6 +22,11 @@ COMPETITION_DISPLAY = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
 
 
 def render(cfg, client, conn):
+    # Apply any pending "Reload" paste BEFORE the text_area is instantiated
+    # (Streamlit forbids touching a widget key after the widget renders).
+    if "_pending_metrics_paste" in st.session_state:
+        st.session_state["metrics_pasted"] = st.session_state.pop("_pending_metrics_paste")
+
     with st.container(border=True):
         _theme.section_title("Input")
         col1, col2 = st.columns([2, 1])
@@ -347,7 +352,7 @@ def _render_saved_searches(cfg, client, conn):
                 st.rerun()
             if cC.button("🔁", key=f"reload_{s['id']}", help="Restore saved output", use_container_width=True):
                 inp = s.get("input_data") or {}
-                st.session_state["metrics_pasted"] = "\n".join(inp.get("keywords", []))
+                st.session_state["_pending_metrics_paste"] = "\n".join(inp.get("keywords", []))
                 out = s.get("output_data") or {}
                 if out.get("rows"):
                     restored = [

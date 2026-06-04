@@ -24,6 +24,13 @@ RESULTS_DISPLAY_CAP = 5000  # safety cap so the table stays responsive
 
 
 def render(cfg, client, conn):
+    # Apply pending "Reload" values BEFORE the widgets render (Streamlit
+    # forbids writing to a widget key after the widget exists in this run).
+    if "_pending_discover_kws" in st.session_state:
+        st.session_state["discover_seed_kws"] = st.session_state.pop("_pending_discover_kws")
+    if "_pending_discover_url" in st.session_state:
+        st.session_state["discover_seed_url"] = st.session_state.pop("_pending_discover_url")
+
     with st.container(border=True):
         _theme.section_title("Seed")
         col1, col2 = st.columns([2, 1])
@@ -350,8 +357,8 @@ def _render_saved_searches(cfg, conn):
                 st.rerun()
             if cC.button("🔁", key=f"discover_reload_{s['id']}", help="Restore saved ideas", use_container_width=True):
                 data = s.get("input_data") or {}
-                st.session_state["discover_seed_kws"] = "\n".join(data.get("keywords") or [])
-                st.session_state["discover_seed_url"] = data.get("url") or ""
+                st.session_state["_pending_discover_kws"] = "\n".join(data.get("keywords") or [])
+                st.session_state["_pending_discover_url"] = data.get("url") or ""
                 out = s.get("output_data") or {}
                 if out.get("ideas"):
                     restored = [row_from_dict(r) for r in out["ideas"]]
