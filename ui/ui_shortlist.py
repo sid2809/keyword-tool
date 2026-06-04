@@ -93,17 +93,41 @@ def render(cfg, client, conn):
     _theme.section_title("All saved searches")
     all_searches = db.list_searches(conn)
     if not all_searches:
-        st.caption("No saved searches.")
+        st.caption("No saved searches. Every run auto-saves under its tab.")
         return
+    st.caption(f"{len(all_searches)} run(s) across all tabs. Click ✏️ to rename, 🗑️ to delete.")
+    editing_id = st.session_state.get("all_editing_id")
     for s in all_searches:
-        cA, cB = st.columns([4, 1])
-        cA.markdown(
-            f"**#{s['id']}** · {s['created_at']:%Y-%m-%d %H:%M} · "
-            f"<span class='kt-chip'>{s['tab']}</span> · "
-            f"`{s['input_count']}` items · "
-            f"{s['label'] or '_(unlabeled)_'}",
-            unsafe_allow_html=True,
-        )
-        if cB.button("Delete", key=f"all_del_{s['id']}", use_container_width=True):
+        label = db.display_label(s)
+        cA, cB, cC = st.columns([5, 1, 1])
+        with cA:
+            if editing_id == s["id"]:
+                new_label = st.text_input(
+                    f"New label for #{s['id']}",
+                    value=s.get("label") or "",
+                    key=f"all_rename_input_{s['id']}",
+                    label_visibility="collapsed",
+                )
+                save_col, cancel_col = st.columns(2)
+                if save_col.button("Save", key=f"all_rename_save_{s['id']}", use_container_width=True):
+                    db.update_search_label(conn, s["id"], new_label or None)
+                    st.session_state["all_editing_id"] = None
+                    st.rerun()
+                if cancel_col.button("Cancel", key=f"all_rename_cancel_{s['id']}", use_container_width=True):
+                    st.session_state["all_editing_id"] = None
+                    st.rerun()
+            else:
+                pill = "" if s.get("label") else " <span class='kt-chip'>auto</span>"
+                st.markdown(
+                    f"**{label}**{pill} <span class='kt-chip'>{s['tab']}</span><br/>"
+                    f"<span style='color:var(--muted); font-size:0.8rem;'>"
+                    f"#{s['id']} · {s['created_at']:%Y-%m-%d %H:%M} · {s['input_count']} items"
+                    f"</span>",
+                    unsafe_allow_html=True,
+                )
+        if cB.button("✏️", key=f"all_edit_{s['id']}", help="Rename", use_container_width=True):
+            st.session_state["all_editing_id"] = s["id"]
+            st.rerun()
+        if cC.button("🗑️", key=f"all_del_{s['id']}", help="Delete", use_container_width=True):
             db.delete_search(conn, s["id"])
             st.rerun()

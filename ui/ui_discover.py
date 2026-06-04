@@ -134,10 +134,19 @@ def _run_discover(cfg, client, conn, seed_kws: list[str], seed_url: str):
     progress.progress(1.0, text=f"Got {len(rows):,} ideas. Done.")
     progress.empty()
     st.session_state["discover_rows"] = rows
-    st.session_state["discover_input"] = {
-        "keywords": seed_kws,
-        "url": seed_url,
-    }
+    st.session_state["discover_input"] = {"keywords": seed_kws, "url": seed_url}
+
+    # Auto-save every successful run (unlabeled). User can label later.
+    seed_count = len(seed_kws or []) + (1 if (seed_url or "").strip() else 0)
+    sid = db.save_search(
+        conn,
+        label=None,
+        tab="discover",
+        input_count=seed_count,
+        filters={},
+        input_data={"keywords": seed_kws, "url": seed_url},
+    )
+    st.session_state["discover_last_search_id"] = sid
     st.success(f"Got {len(rows)} ideas.")
 
 
@@ -249,27 +258,20 @@ def _render_results(cfg, conn, rows: list[Row]):
                 use_container_width=True,
             )
         with cC:
+            last_sid = st.session_state.get("discover_last_search_id")
             label = st.text_input(
-                "Save this search as…",
+                "Label this run…",
                 key="discover_save_label",
                 placeholder="e.g. competitor URL exploration",
                 label_visibility="collapsed",
+                disabled=not last_sid,
             )
-            if st.button("Save search", key="discover_save", use_container_width=True):
-                sid = db.save_search(
-                    conn,
-                    label=label or None,
-                    tab="discover",
-                    input_count=len(st.session_state.get("discover_input", {}).get("keywords", []) or []) +
-                                (1 if st.session_state.get("discover_input", {}).get("url") else 0),
-                    filters={
-                        "min_searches": min_searches,
-                        "max_high_bid": max_high_bid,
-                        "competition": comp_selected,
-                    },
-                    input_data=st.session_state.get("discover_input", {}),
-                )
-                st.success(f"Saved search #{sid}.")
+            if st.button(
+                "Label this run", key="discover_save",
+                use_container_width=True, disabled=not last_sid,
+            ):
+                db.update_search_label(conn, last_sid, label or None)
+                st.toast(f"Search #{last_sid} labeled.")
 
 
 def _persist_shortlist_toggles(conn, filtered_df, edited_df):
@@ -306,23 +308,50 @@ def _persist_shortlist_toggles(conn, filtered_df, edited_df):
 
 
 def _render_saved_searches(cfg, conn):
-    with st.expander("Saved discover searches", expanded=False):
+    with st.expander("Discover history (auto-saved)", expanded=False):
         saved = db.list_searches(conn, tab="discover")
         if not saved:
-            st.caption("No saved discovery runs yet.")
+            st.caption("No discovery runs yet. Every run auto-saves here.")
             return
+        st.caption(f"{len(saved)} run(s). Click ✏️ to rename, 🔁 to reload, 🗑️ to delete.")
+        editing_id = st.session_state.get("discover_editing_id")
         for s in saved:
-            cA, cB, cC = st.columns([3, 1, 1])
-            cA.markdown(
-                f"**#{s['id']}** · {s['created_at']:%Y-%m-%d %H:%M} · "
-                f"`{s['input_count']}` seeds · {s['label'] or '_(unlabeled)_'}"
-            )
-            if cB.button("Reload", key=f"discover_reload_{s['id']}"):
+            label = db.display_label(s)
+            cA, cB, cC, cD = st.columns([4, 1, 1, 1])
+            with cA:
+                if editing_id == s["id"]:
+                    new_label = st.text_input(
+                        f"New label for #{s['id']}",
+                        value=s.get("label") or "",
+                        key=f"discover_rename_input_{s['id']}",
+                        label_visibility="collapsed",
+                    )
+                    save_col, cancel_col = st.columns(2)
+                    if save_col.button("Save", key=f"discover_rename_save_{s['id']}", use_container_width=True):
+                        db.update_search_label(conn, s["id"], new_label or None)
+                        st.session_state["discover_editing_id"] = None
+                        st.rerun()
+                    if cancel_col.button("Cancel", key=f"discover_rename_cancel_{s['id']}", use_container_width=True):
+                        st.session_state["discover_editing_id"] = None
+                        st.rerun()
+                else:
+                    pill = "" if s.get("label") else " <span class='kt-chip'>auto</span>"
+                    st.markdown(
+                        f"**{label}**{pill}<br/>"
+                        f"<span style='color:var(--muted); font-size:0.8rem;'>"
+                        f"#{s['id']} · {s['created_at']:%Y-%m-%d %H:%M} · {s['input_count']} seeds"
+                        f"</span>",
+                        unsafe_allow_html=True,
+                    )
+            if cB.button("✏️", key=f"discover_edit_{s['id']}", help="Rename", use_container_width=True):
+                st.session_state["discover_editing_id"] = s["id"]
+                st.rerun()
+            if cC.button("🔁", key=f"discover_reload_{s['id']}", help="Reload into seed", use_container_width=True):
                 data = s["input_data"] or {}
                 st.session_state["discover_seed_kws"] = "\n".join(data.get("keywords") or [])
                 st.session_state["discover_seed_url"] = data.get("url") or ""
                 st.toast("Loaded — click Discover.")
                 st.rerun()
-            if cC.button("Delete", key=f"discover_del_{s['id']}"):
+            if cD.button("🗑️", key=f"discover_del_{s['id']}", help="Delete", use_container_width=True):
                 db.delete_search(conn, s["id"])
                 st.rerun()

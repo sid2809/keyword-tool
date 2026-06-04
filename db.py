@@ -82,6 +82,32 @@ def delete_search(conn, search_id: int) -> None:
     conn.commit()
 
 
+def update_search_label(conn, search_id: int, label: Optional[str]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE searches SET label = %s WHERE id = %s",
+            (label or None, search_id),
+        )
+    conn.commit()
+
+
+def display_label(search: dict) -> str:
+    """Render label or synthesize one from the input data."""
+    if search.get("label"):
+        return search["label"]
+    data = search.get("input_data") or {}
+    kws = data.get("keywords") or []
+    if kws:
+        head = kws[0]
+        if len(kws) > 1:
+            return f"{head} +{len(kws)-1}"
+        return head
+    if data.get("url"):
+        url = data["url"]
+        return url if len(url) <= 50 else url[:47] + "…"
+    return "Untitled"
+
+
 # ---------- shortlist ----------
 
 def add_to_shortlist(

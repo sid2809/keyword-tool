@@ -127,6 +127,17 @@ def _run_metrics(cfg, client, conn, keywords: list[str], force_refresh: bool):
     st.session_state["metrics_last_calls"] = state["calls"]
     st.session_state["metrics_last_unique"] = len(rows_by_kw)
 
+    # Auto-save every successful run (unlabeled). User can label later.
+    sid = db.save_search(
+        conn,
+        label=None,
+        tab="metrics",
+        input_count=len(keywords),
+        filters={"force_refresh": force_refresh},
+        input_data={"keywords": keywords},
+    )
+    st.session_state["metrics_last_search_id"] = sid
+
 
 def _output_to_df(output: list[tuple[str, Row]]) -> pd.DataFrame:
     rows = []
@@ -238,27 +249,20 @@ def _render_results(cfg, conn, output: list[tuple[str, Row]]):
                 use_container_width=True,
             )
         with cC:
+            last_sid = st.session_state.get("metrics_last_search_id")
             label = st.text_input(
-                "Save this search as…",
+                "Label this run…",
                 key="metrics_save_label",
                 placeholder="e.g. June insurance pull",
                 label_visibility="collapsed",
+                disabled=not last_sid,
             )
-            if st.button("Save search", key="metrics_save_search", use_container_width=True):
-                sid = db.save_search(
-                    conn,
-                    label=label or None,
-                    tab="metrics",
-                    input_count=len(st.session_state.get("metrics_input_keywords", [])),
-                    filters={
-                        "min_searches": min_searches,
-                        "max_high_bid": max_high_bid,
-                        "competition": comp_selected,
-                        "force_refresh": st.session_state.get("metrics_force", False),
-                    },
-                    input_data={"keywords": st.session_state.get("metrics_input_keywords", [])},
-                )
-                st.success(f"Saved search #{sid}.")
+            if st.button(
+                "Label this run", key="metrics_save_search",
+                use_container_width=True, disabled=not last_sid,
+            ):
+                db.update_search_label(conn, last_sid, label or None)
+                st.toast(f"Search #{last_sid} labeled.")
 
 
 def _persist_shortlist_toggles(conn, filtered_df, edited_df):
@@ -297,21 +301,48 @@ def _persist_shortlist_toggles(conn, filtered_df, edited_df):
 
 
 def _render_saved_searches(cfg, client, conn):
-    with st.expander("Saved searches", expanded=False):
+    with st.expander("Search history (auto-saved)", expanded=False):
         saved = db.list_searches(conn, tab="metrics")
         if not saved:
-            st.caption("No saved searches yet.")
+            st.caption("No saved searches yet. Every run auto-saves here.")
             return
+        st.caption(f"{len(saved)} run(s). Click ✏️ to rename, 🔁 to reload into the input box, 🗑️ to delete.")
+        editing_id = st.session_state.get("metrics_editing_id")
         for s in saved:
-            cA, cB, cC = st.columns([3, 1, 1])
-            cA.markdown(
-                f"**#{s['id']}** · {s['created_at']:%Y-%m-%d %H:%M} · "
-                f"`{s['input_count']}` keywords · {s['label'] or '_(unlabeled)_'}"
-            )
-            if cB.button("Reload", key=f"reload_{s['id']}"):
+            label = db.display_label(s)
+            cA, cB, cC, cD = st.columns([4, 1, 1, 1])
+            with cA:
+                if editing_id == s["id"]:
+                    new_label = st.text_input(
+                        f"New label for #{s['id']}",
+                        value=s.get("label") or "",
+                        key=f"rename_input_{s['id']}",
+                        label_visibility="collapsed",
+                    )
+                    save_col, cancel_col = st.columns(2)
+                    if save_col.button("Save", key=f"rename_save_{s['id']}", use_container_width=True):
+                        db.update_search_label(conn, s["id"], new_label or None)
+                        st.session_state["metrics_editing_id"] = None
+                        st.rerun()
+                    if cancel_col.button("Cancel", key=f"rename_cancel_{s['id']}", use_container_width=True):
+                        st.session_state["metrics_editing_id"] = None
+                        st.rerun()
+                else:
+                    pill = "" if s.get("label") else " <span class='kt-chip'>auto</span>"
+                    st.markdown(
+                        f"**{label}**{pill}<br/>"
+                        f"<span style='color:var(--muted); font-size:0.8rem;'>"
+                        f"#{s['id']} · {s['created_at']:%Y-%m-%d %H:%M} · {s['input_count']} keywords"
+                        f"</span>",
+                        unsafe_allow_html=True,
+                    )
+            if cB.button("✏️", key=f"edit_{s['id']}", help="Rename", use_container_width=True):
+                st.session_state["metrics_editing_id"] = s["id"]
+                st.rerun()
+            if cC.button("🔁", key=f"reload_{s['id']}", help="Reload into input box", use_container_width=True):
                 st.session_state["metrics_pasted"] = "\n".join(s["input_data"].get("keywords", []))
                 st.toast("Loaded into the input box — click Run.")
                 st.rerun()
-            if cC.button("Delete", key=f"del_{s['id']}"):
+            if cD.button("🗑️", key=f"del_{s['id']}", help="Delete", use_container_width=True):
                 db.delete_search(conn, s["id"])
                 st.rerun()
