@@ -56,13 +56,17 @@ def fetch_historical_metrics(
 
     if not missing:
         if progress_cb:
-            progress_cb(0, 0)
+            progress_cb(0, 0, "done", 0)
         return fresh
 
     chunks = [missing[i:i + chunk_size] for i in range(0, len(missing), chunk_size)]
     total = len(chunks)
     fetched: dict[str, Row] = {}
     for idx, chunk in enumerate(chunks, start=1):
+        # Fire BEFORE the (slow, blocking) API call so the UI shows which
+        # chunk is in flight instead of looking frozen.
+        if progress_cb:
+            progress_cb(idx, total, "start", len(chunk))
         results = _call_chunk(client, customer_id, chunk, geo_target, months)
         chunk_rows = _map_results_to_rows(
             results, chunk,
@@ -71,9 +75,11 @@ def fetch_historical_metrics(
         )
         fetched.update(chunk_rows)
         if progress_cb:
-            progress_cb(idx, total)
+            progress_cb(idx, total, "done", len(chunk))
 
     # Upsert everything we fetched (cache hits already in DB; no need to re-write).
+    if progress_cb:
+        progress_cb(total, total, "saving", len(fetched))
     cache_mod.upsert_rows(conn, fetched.values(), store_monthly_volumes=store_monthly_volumes)
 
     return {**fresh, **fetched}

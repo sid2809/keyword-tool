@@ -20,7 +20,8 @@ from ui import _theme
 
 COMPETITION_DISPLAY = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
 SEED_KW_MAX = 20  # Phase 0 confirmed cap
-RESULTS_DISPLAY_CAP = 5000  # safety cap so the table stays responsive
+INITIAL_VISIBLE_ROWS = 1000   # how many idea rows the grid shows first
+LOAD_MORE_STEP = 1000         # increment per "Load more" click
 
 
 def _restore_from_record(s: dict) -> None:
@@ -182,6 +183,7 @@ def _run_discover(cfg, client, conn, seed_kws: list[str], seed_url: str):
         output_data=snapshot,
     )
     st.session_state["discover_last_search_id"] = sid
+    st.session_state["discover_visible_rows"] = INITIAL_VISIBLE_ROWS  # reset paging
     # Fresh run supersedes any prior URL-driven restore context.
     st.session_state.pop("_restore_search", None)
     st.session_state.pop("_loaded_search_id", None)
@@ -250,55 +252,30 @@ def _render_results(cfg, conn, rows: list[Row]):
     if comp_selected and len(comp_selected) < 3:
         mask &= df["Competition"].isin(comp_selected)
     filtered = df[mask].copy()
+    total_filtered = len(filtered)
 
-    capped = False
-    if len(filtered) > RESULTS_DISPLAY_CAP:
-        capped = True
-        filtered = filtered.head(RESULTS_DISPLAY_CAP)
+    # Changing filters resets paging back to the first page.
+    filter_sig = (min_searches, max_high_bid, tuple(sorted(comp_selected)))
+    if st.session_state.get("discover_filter_sig") != filter_sig:
+        st.session_state["discover_filter_sig"] = filter_sig
+        st.session_state["discover_visible_rows"] = INITIAL_VISIBLE_ROWS
 
-    cap_note = f" (showing first {RESULTS_DISPLAY_CAP:,})" if capped else ""
-    st.caption(f"Showing {len(filtered):,} of {len(df):,} ideas after filters{cap_note}.")
-
-    sl_keywords = db.shortlist_keywords(conn)
-    filtered["Shortlist"] = filtered["Keyword"].apply(lambda k: k in sl_keywords)
-
-    display_cols = ["Shortlist", "Keyword", "Avg searches (last 3mo)",
-                    "3 month change (%)", "Competition",
-                    "Low bid (₹)", "High bid (₹)", "Status"]
-    edited = st.data_editor(
-        filtered[display_cols],
-        hide_index=True,
-        disabled=[c for c in display_cols if c != "Shortlist"],
-        column_config={
-            "Shortlist": st.column_config.CheckboxColumn(default=False),
-            "Avg searches (last 3mo)": st.column_config.NumberColumn(format="%d"),
-            "3 month change (%)": st.column_config.NumberColumn(format="%+.2f"),
-            "Low bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-            "High bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-        },
-        use_container_width=True,
-        key="discover_table",
-    )
-
+    # --- Export & save above the table (full filtered set, instant CSV).
     with st.container(border=True):
-        _theme.section_title("Actions")
-        cA, cB, cC = st.columns([1, 1, 1.4])
+        _theme.section_title("Export & save")
+        cA, cB = st.columns([1, 1.4])
         with cA:
-            if st.button("Save shortlist toggles", key="discover_save_sl", use_container_width=True):
-                _persist_shortlist_toggles(conn, filtered, edited)
-                st.rerun()
-        with cB:
             as_pairs = [(r._row.keyword, r._row) for _, r in filtered.iterrows()]
             csv_str = export.output_rows_to_csv(as_pairs)
             st.download_button(
-                "Download CSV",
+                f"Download CSV ({total_filtered:,} rows)",
                 data=csv_str.encode("utf-8"),
                 file_name="keyword_ideas.csv",
                 mime="text/csv",
                 key="discover_dl",
                 use_container_width=True,
             )
-        with cC:
+        with cB:
             last_sid = st.session_state.get("discover_last_search_id")
             label = st.text_input(
                 "Label this run…",
@@ -313,6 +290,58 @@ def _render_results(cfg, conn, rows: list[Row]):
             ):
                 db.update_search_label(conn, last_sid, label or None)
                 st.toast(f"Search #{last_sid} labeled.")
+
+    # --- Interactive table, paged via "Load more"
+    visible = min(st.session_state.get("discover_visible_rows", INITIAL_VISIBLE_ROWS), total_filtered)
+    view = filtered.head(visible).copy()
+
+    if total_filtered > INITIAL_VISIBLE_ROWS:
+        st.caption(
+            f"Showing first **{visible:,}** of **{total_filtered:,}** matching ideas "
+            f"({len(df):,} total). CSV above exports all {total_filtered:,}. "
+            f"Shortlist checkboxes apply to visible rows only."
+        )
+    else:
+        st.caption(f"Showing {total_filtered:,} of {len(df):,} ideas after filters.")
+
+    sl_keywords = db.shortlist_keywords(conn)
+    view["Shortlist"] = view["Keyword"].apply(lambda k: k in sl_keywords)
+
+    display_cols = ["Shortlist", "Keyword", "Avg searches (last 3mo)",
+                    "3 month change (%)", "Competition",
+                    "Low bid (₹)", "High bid (₹)", "Status"]
+    edited = st.data_editor(
+        view[display_cols],
+        hide_index=True,
+        disabled=[c for c in display_cols if c != "Shortlist"],
+        column_config={
+            "Shortlist": st.column_config.CheckboxColumn(default=False),
+            "Avg searches (last 3mo)": st.column_config.NumberColumn(format="%d"),
+            "3 month change (%)": st.column_config.NumberColumn(format="%+.2f"),
+            "Low bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "High bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+        },
+        use_container_width=True,
+        key="discover_table",
+    )
+
+    # --- Load-more controls
+    if visible < total_filtered:
+        remaining = total_filtered - visible
+        step = min(LOAD_MORE_STEP, remaining)
+        lc1, lc2, lc3 = st.columns([1, 1, 2])
+        if lc1.button(f"Load {step:,} more", key="discover_load_more", use_container_width=True):
+            st.session_state["discover_visible_rows"] = visible + LOAD_MORE_STEP
+            st.rerun()
+        if lc2.button(f"Show all ({total_filtered:,})", key="discover_show_all", use_container_width=True):
+            st.session_state["discover_visible_rows"] = total_filtered
+            st.rerun()
+        lc3.caption(f"{remaining:,} more ideas not shown (still in CSV).")
+
+    # Save-shortlist needs `edited`, so it stays below the table.
+    if st.button("Save shortlist toggles (visible rows)", key="discover_save_sl"):
+        _persist_shortlist_toggles(conn, view, edited)
+        st.rerun()
 
 
 def _persist_shortlist_toggles(conn, filtered_df, edited_df):

@@ -103,8 +103,9 @@ def main():
 
         t0 = time.time()
         with CallCounter() as cc:
-            def progress(done, total):
-                print(f"  chunk {done}/{total}")
+            def progress(done, total, phase="done", chunk_n=0):
+                if total and phase == "done":
+                    print(f"  chunk {done}/{total} done")
             rows_by_kw = fetch_historical_metrics(
                 keywords,
                 client=client,

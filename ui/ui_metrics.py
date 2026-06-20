@@ -131,13 +131,24 @@ def _run_metrics(cfg, client, conn, keywords: list[str], force_refresh: bool):
     progress = st.progress(0.0, text="Starting…")
     state = {"calls": 0}
 
-    def progress_cb(done, total):
+    def progress_cb(done, total, phase="done", chunk_n=0):
         if total <= 0:
-            progress.progress(1.0, text="Cache hits — no API calls.")
+            progress.progress(1.0, text="Served from cache — no API calls.")
             return
-        state["calls"] = done
-        frac = done / total
-        progress.progress(frac, text=f"Chunk {done}/{total}")
+        if phase == "start":
+            # About to issue a blocking API call for this chunk.
+            frac = (done - 1) / total
+            progress.progress(
+                frac,
+                text=f"Fetching chunk {done}/{total} ({chunk_n:,} keywords) from Google Ads… "
+                     f"large chunks can take ~30–90s.",
+            )
+        elif phase == "saving":
+            progress.progress(0.99, text=f"Saving {chunk_n:,} rows to cache…")
+        else:  # done
+            state["calls"] = done
+            frac = done / total
+            progress.progress(frac, text=f"Chunk {done}/{total} done.")
 
     currency = st.session_state.get("currency_code")
     if not currency:
