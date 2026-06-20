@@ -125,30 +125,31 @@ _VALID_VIEWS = set(_VIEW_TO_LABEL)
 
 
 def _apply_url_state(cfg: Config) -> None:
-    """At the top of each run, BEFORE any widget renders: sync the active
-    view + saved-search restoration from URL query params.
+    """At the top of each run, BEFORE any widget renders: seed the view from
+    the URL on FIRST load only, and handle one-shot saved-search restores.
 
-    We always keep _restore_search alive while ?search= is in the URL —
-    the per-tab render() decides (via _last_applied_search_id) whether to
-    actually re-apply the restore on this run.
+    Key rule: we do NOT re-force the segmented control from ?view= on every
+    rerun. The widget is authoritative for navigation; re-forcing would let a
+    stale URL override a manual tab click. `_force_segment` is a one-shot the
+    tab strip consumes only when we genuinely need to move the selection
+    (first load or a search deep-link).
     """
     qp = st.query_params
     requested_view = qp.get("view") if qp.get("view") in _VALID_VIEWS else None
     requested_search = qp.get("search")
 
-    if requested_view:
-        st.session_state["view"] = requested_view
-        st.session_state["_view_segmented"] = _VIEW_TO_LABEL[requested_view]
-    elif "view" not in st.session_state:
-        st.session_state["view"] = "metrics"
+    # Seed the initial view exactly once (first load / shared link).
+    if "view" not in st.session_state:
+        initial = requested_view or "metrics"
+        st.session_state["view"] = initial
+        st.session_state["_force_segment"] = _VIEW_TO_LABEL[initial]
 
     if not requested_search:
-        # No active saved-view in URL — drop any stale directive.
         st.session_state.pop("_restore_search", None)
         st.session_state.pop("_loaded_search_id", None)
         return
 
-    # Load (or reuse cached) record for this URL.
+    # One-shot saved-search restore for this URL's ?search= id.
     cached = st.session_state.get("_restore_search")
     if not cached or st.session_state.get("_loaded_search_id") != requested_search:
         try:
@@ -161,11 +162,10 @@ def _apply_url_state(cfg: Config) -> None:
             return
         st.session_state["_restore_search"] = record
         st.session_state["_loaded_search_id"] = requested_search
-        # Snap view to the record's tab so the right render() consumes it.
         tab = record.get("tab")
         if tab in _VALID_VIEWS:
             st.session_state["view"] = tab
-            st.session_state["_view_segmented"] = _VIEW_TO_LABEL[tab]
+            st.session_state["_force_segment"] = _VIEW_TO_LABEL[tab]  # one-shot
             st.query_params["view"] = tab
 
 
@@ -184,8 +184,10 @@ def _go_home() -> None:
         st.session_state.pop(key, None)
     # Reset the segmented_control widget by removing its key too.
     st.session_state.pop("_view_segmented", None)
+    st.session_state.pop("_force_segment", None)
     st.query_params.clear()
     st.session_state["view"] = "metrics"
+    st.session_state["_force_segment"] = _VIEW_TO_LABEL["metrics"]
     st.rerun()
 
 
@@ -219,15 +221,21 @@ def main():
     ]
     _theme.header("Keyword Tool", "Bulk keyword research with cached Postgres lookups", badges)
 
-    # Tab strip — segmented_control is programmatically selectable.
-    view = st.session_state.get("view", "metrics")
+    # Tab strip. The segmented control is the source of truth for navigation;
+    # `_force_segment` (one-shot) is applied only on first load / search
+    # restore, so a stale ?view= can never override a manual click.
     label_options = list(_VIEW_TO_LABEL.values())
+    force_label = st.session_state.pop("_force_segment", None)
+    if force_label is not None:
+        st.session_state["_view_segmented"] = force_label
+    elif "_view_segmented" not in st.session_state:
+        st.session_state["_view_segmented"] = _VIEW_TO_LABEL[st.session_state.get("view", "metrics")]
+
     col_strip, col_home = st.columns([5, 1])
     with col_strip:
         new_label = st.segmented_control(
             "View",
             options=label_options,
-            default=_VIEW_TO_LABEL[view],
             selection_mode="single",
             label_visibility="collapsed",
             key="_view_segmented",
@@ -236,16 +244,16 @@ def main():
         if st.button("🏠 Home", use_container_width=True, key="header_home"):
             _go_home()
 
-    new_view = _LABEL_TO_VIEW.get(new_label or "", view)
-    if new_view != view:
+    # Widget wins. Fall back to current view if the control was deselected.
+    new_view = _LABEL_TO_VIEW.get(new_label or "", st.session_state.get("view", "metrics"))
+    if new_view != st.session_state.get("view"):
         st.session_state["view"] = new_view
         st.query_params["view"] = new_view
-        # Clear search param on manual tab switch — the saved-search context
-        # belongs to a specific tab and shouldn't bleed across.
+        # A manual tab switch ends any saved-search deep-link context.
         if "search" in st.query_params:
             del st.query_params["search"]
-            st.session_state.pop("_loaded_search_id", None)
-        st.rerun()
+        st.session_state.pop("_loaded_search_id", None)
+        st.session_state.pop("_restore_search", None)
 
     with get_conn(cfg) as conn:
         if new_view == "metrics":
