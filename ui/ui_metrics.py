@@ -20,6 +20,9 @@ from ui import _theme
 
 COMPETITION_DISPLAY = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
 
+INITIAL_VISIBLE_ROWS = 1000   # how many rows the on-screen grid shows first
+LOAD_MORE_STEP = 1000         # increment per "Load more" click
+
 
 def _restore_from_record(s: dict) -> None:
     """Stage session_state for a saved-search restore. Must be called BEFORE
@@ -185,6 +188,7 @@ def _run_metrics(cfg, client, conn, keywords: list[str], force_refresh: bool):
         output_data=snapshot,
     )
     st.session_state["metrics_last_search_id"] = sid
+    st.session_state["metrics_visible_rows"] = INITIAL_VISIBLE_ROWS  # reset paging
     # Fresh run supersedes any prior URL-driven restore context.
     st.session_state.pop("_restore_search", None)
     st.session_state.pop("_loaded_search_id", None)
@@ -248,61 +252,41 @@ def _render_results(cfg, conn, output: list[tuple[str, Row]]):
                 "Competition", comp_options, default=comp_options, key="filter_comp",
             )
 
-    # Apply filters
+    # Apply filters to the FULL set
     mask = pd.Series([True] * len(df))
     if min_searches > 0:
         mask &= df["Avg searches (last 3mo)"].fillna(-1) >= min_searches
     if max_high_bid > 0:
         mask &= df["High bid (₹)"].fillna(float("inf")) <= max_high_bid
-    if comp_selected:
-        # Show no-data rows only if Low+Medium+High all selected (i.e. no filter active)
-        if len(comp_selected) < 3:
-            mask &= df["Competition"].isin(comp_selected)
+    if comp_selected and len(comp_selected) < 3:
+        mask &= df["Competition"].isin(comp_selected)
     filtered = df[mask].copy()
+    total_filtered = len(filtered)
 
-    st.caption(f"Showing {len(filtered)} of {len(df)} rows after filters.")
+    # Changing filters resets paging back to the first page.
+    filter_sig = (min_searches, max_high_bid, tuple(sorted(comp_selected)))
+    if st.session_state.get("metrics_filter_sig") != filter_sig:
+        st.session_state["metrics_filter_sig"] = filter_sig
+        st.session_state["metrics_visible_rows"] = INITIAL_VISIBLE_ROWS
 
-    sl_keywords = db.shortlist_keywords(conn)
-    filtered["Shortlist"] = filtered["_norm"].apply(lambda n: n in sl_keywords)
-
-    display_cols = ["Shortlist", "Keyword", "Avg searches (last 3mo)",
-                    "3 month change (%)", "Competition",
-                    "Low bid (₹)", "High bid (₹)", "Status"]
-    edited = st.data_editor(
-        filtered[display_cols],
-        hide_index=True,
-        disabled=[c for c in display_cols if c != "Shortlist"],
-        column_config={
-            "Shortlist": st.column_config.CheckboxColumn(default=False),
-            "Avg searches (last 3mo)": st.column_config.NumberColumn(format="%d"),
-            "3 month change (%)": st.column_config.NumberColumn(format="%+.2f"),
-            "Low bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-            "High bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-        },
-        use_container_width=True,
-        key="metrics_table",
-    )
-
+    # --- Export & save: operates on the FULL filtered set, rendered ABOVE the
+    #     heavy table so CSV is available immediately and never waits on paint.
     with st.container(border=True):
-        _theme.section_title("Actions")
-        cA, cB, cC = st.columns([1, 1, 1.4])
+        _theme.section_title("Export & save")
+        cA, cB = st.columns([1, 1.4])
         with cA:
-            if st.button("Save shortlist toggles", key="metrics_save_sl", use_container_width=True):
-                _persist_shortlist_toggles(conn, filtered, edited)
-                st.rerun()
-        with cB:
             csv_str = export.output_rows_to_csv(
                 [(inp, r) for inp, r in output if cache_mod.normalize(inp) in set(filtered["_norm"])]
             )
             st.download_button(
-                "Download CSV",
+                f"Download CSV ({total_filtered:,} rows)",
                 data=csv_str.encode("utf-8"),
                 file_name="keywords_filtered.csv",
                 mime="text/csv",
                 key="metrics_dl_filtered",
                 use_container_width=True,
             )
-        with cC:
+        with cB:
             last_sid = st.session_state.get("metrics_last_search_id")
             label = st.text_input(
                 "Label this run…",
@@ -317,6 +301,58 @@ def _render_results(cfg, conn, output: list[tuple[str, Row]]):
             ):
                 db.update_search_label(conn, last_sid, label or None)
                 st.toast(f"Search #{last_sid} labeled.")
+
+    # --- Interactive table, paged via "Load more"
+    visible = min(st.session_state.get("metrics_visible_rows", INITIAL_VISIBLE_ROWS), total_filtered)
+    view = filtered.head(visible).copy()
+
+    if total_filtered > INITIAL_VISIBLE_ROWS:
+        st.caption(
+            f"Showing first **{visible:,}** of **{total_filtered:,}** matching rows "
+            f"({len(df):,} total). CSV above exports all {total_filtered:,}. "
+            f"Shortlist checkboxes apply to visible rows only."
+        )
+    else:
+        st.caption(f"Showing {total_filtered:,} of {len(df):,} rows after filters.")
+
+    sl_keywords = db.shortlist_keywords(conn)
+    view["Shortlist"] = view["_norm"].apply(lambda n: n in sl_keywords)
+
+    display_cols = ["Shortlist", "Keyword", "Avg searches (last 3mo)",
+                    "3 month change (%)", "Competition",
+                    "Low bid (₹)", "High bid (₹)", "Status"]
+    edited = st.data_editor(
+        view[display_cols],
+        hide_index=True,
+        disabled=[c for c in display_cols if c != "Shortlist"],
+        column_config={
+            "Shortlist": st.column_config.CheckboxColumn(default=False),
+            "Avg searches (last 3mo)": st.column_config.NumberColumn(format="%d"),
+            "3 month change (%)": st.column_config.NumberColumn(format="%+.2f"),
+            "Low bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "High bid (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+        },
+        use_container_width=True,
+        key="metrics_table",
+    )
+
+    # --- Load-more controls (only when more rows exist than are shown)
+    if visible < total_filtered:
+        remaining = total_filtered - visible
+        step = min(LOAD_MORE_STEP, remaining)
+        lc1, lc2, lc3 = st.columns([1, 1, 2])
+        if lc1.button(f"Load {step:,} more", key="metrics_load_more", use_container_width=True):
+            st.session_state["metrics_visible_rows"] = visible + LOAD_MORE_STEP
+            st.rerun()
+        if lc2.button(f"Show all ({total_filtered:,})", key="metrics_show_all", use_container_width=True):
+            st.session_state["metrics_visible_rows"] = total_filtered
+            st.rerun()
+        lc3.caption(f"{remaining:,} more rows not shown (still in CSV).")
+
+    # Save-shortlist needs `edited`, so it stays below the table.
+    if st.button("Save shortlist toggles (visible rows)", key="metrics_save_sl"):
+        _persist_shortlist_toggles(conn, view, edited)
+        st.rerun()
 
 
 def _persist_shortlist_toggles(conn, filtered_df, edited_df):
